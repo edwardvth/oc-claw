@@ -9307,7 +9307,7 @@ fn openclaw_has_window() -> bool {
 }
 
 /// Poll for an OpenClaw window: first check after `first_ms`, then every
-/// 500 ms until `total_ms` has elapsed.
+/// 100 ms until `total_ms` has elapsed.
 #[cfg(target_os = "macos")]
 fn wait_for_openclaw_window(first_ms: u64, total_ms: u64) -> bool {
     let start = std::time::Instant::now();
@@ -9315,7 +9315,7 @@ fn wait_for_openclaw_window(first_ms: u64, total_ms: u64) -> bool {
     loop {
         if openclaw_has_window() { return true; }
         if start.elapsed().as_millis() as u64 >= total_ms { return false; }
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
@@ -9400,7 +9400,7 @@ fn ax_open_chat_via_status_item() -> Result<(), String> {
 /// Returns the selected row's text; on failure logs a compact map of the
 /// window's AX tree so the selector can be adjusted.
 #[cfg(target_os = "macos")]
-fn select_most_recent_openclaw_session() -> Result<String, String> {
+fn select_most_recent_openclaw_session(log_failure: bool) -> Result<String, String> {
     if !check_accessibility_permission() {
         prompt_accessibility_permission();
         let msg = "most-recent-session selection needs Accessibility permission for oc-claw (System Settings > Privacy & Security > Accessibility)";
@@ -9483,7 +9483,8 @@ fn select_most_recent_openclaw_session() -> Result<String, String> {
     ax::release(app);
     match &result {
         Ok(name) => log::info!("[openclaw_chat] selected most recent session row: {} (visited {} nodes)", name, visited),
-        Err(e) => log::warn!("[openclaw_chat] session selection failed: {} (visited {} nodes)\nAX tree (first {} nodes):\n{}", e, visited, dump.len(), dump.join("\n")),
+        Err(e) if log_failure => log::warn!("[openclaw_chat] session selection failed: {} (visited {} nodes)\nAX tree (first {} nodes):\n{}", e, visited, dump.len(), dump.join("\n")),
+        Err(_) => {}
     }
     result
 }
@@ -9492,10 +9493,23 @@ fn select_most_recent_openclaw_session() -> Result<String, String> {
 /// select the most recent session. Selection problems never fail the click.
 #[cfg(target_os = "macos")]
 fn finish_with_recent_session(step: &str) -> String {
-    std::thread::sleep(std::time::Duration::from_millis(600));
-    match select_most_recent_openclaw_session() {
-        Ok(name) => format!("{} + selected session '{}'", step, name),
-        Err(e) => format!("{} (session selection skipped: {})", step, e),
+    // The web view may still be rendering when the window first appears, so
+    // retry quickly until the sidebar link is found (or ~3 s pass) instead of
+    // sleeping a fixed interval. Permission errors are not retried.
+    let start = std::time::Instant::now();
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        match select_most_recent_openclaw_session(start.elapsed() > std::time::Duration::from_millis(2500)) {
+            Ok(name) => {
+                log::info!("[openclaw_chat] session selected after {} attempt(s), {} ms", attempts, start.elapsed().as_millis());
+                return format!("{} + selected session '{}'", step, name);
+            }
+            Err(e) if e.contains("Accessibility") || start.elapsed() > std::time::Duration::from_millis(3000) => {
+                return format!("{} (session selection skipped: {})", step, e);
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(80)),
+        }
     }
 }
 
@@ -9527,7 +9541,7 @@ fn open_openclaw_chat_blocking() -> Result<String, String> {
             Ok(_) => {}
             Err(e) => log::warn!("[openclaw_chat] step a: activate failed: {}", e),
         }
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        std::thread::sleep(std::time::Duration::from_millis(100));
         if openclaw_has_window() {
             log::info!("[openclaw_chat] step a succeeded: activate brought an existing window to front");
             return Ok(finish_with_recent_session("a: activate"));
@@ -9543,11 +9557,11 @@ fn open_openclaw_chat_blocking() -> Result<String, String> {
         Ok(out) => log::warn!("[openclaw_chat] step b: open --args --chat failed: {}", String::from_utf8_lossy(&out.stderr).trim()),
         Err(e) => log::warn!("[openclaw_chat] step b: could not run open: {}", e),
     }
-    // Re-check after 1.5 s; a running app shows the chat window well within
-    // that, but a cold launch needs ~10 s on this machine, so keep polling.
-    // Do not call `open`/`activate` again until a window exists, for the
-    // same not-responding reason as above.
-    if wait_for_openclaw_window(1500, 15_000) {
+    // Start checking after 200 ms and keep polling: a running app shows the
+    // chat window in well under a second, a cold launch needs ~10 s on this
+    // machine. Do not call `open`/`activate` again until a window exists,
+    // for the same not-responding reason as above.
+    if wait_for_openclaw_window(200, 15_000) {
         let _ = run_osascript(r#"tell application "OpenClaw" to activate"#);
         log::info!("[openclaw_chat] step b succeeded: open -a OpenClaw --args --chat opened a window");
         return Ok(finish_with_recent_session("b: open --args --chat"));
