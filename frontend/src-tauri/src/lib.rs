@@ -9232,20 +9232,39 @@ async fn open_openclaw_chat() -> Result<String, String> {
     }
 }
 
+/// Is an OpenClaw.app process running?
+#[cfg(target_os = "macos")]
+fn openclaw_is_running() -> bool {
+    std::process::Command::new("pgrep")
+        .args(["-x", "OpenClaw"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 #[cfg(target_os = "macos")]
 fn open_openclaw_chat_blocking() -> Result<String, String> {
-    // Step a: plain activate.
-    match run_osascript(r#"tell application "OpenClaw" to activate"#) {
-        Ok(_) => {}
-        Err(e) => log::warn!("[openclaw_chat] step a: activate failed: {}", e),
-    }
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    if openclaw_has_window() {
-        log::info!("[openclaw_chat] step a succeeded: activate brought an existing window to front");
-        return Ok("a: activate".into());
+    // Step a: plain activate. Only when the app is already running: a cold
+    // launch takes ~10 s before OpenClaw processes events, and issuing a
+    // second open (step b) during that window makes macOS show the
+    // "can't open OpenClaw because it is not responding" dialog. If it is
+    // not running we go straight to step b, which launches it with --chat.
+    if openclaw_is_running() {
+        match run_osascript(r#"tell application "OpenClaw" to activate"#) {
+            Ok(_) => {}
+            Err(e) => log::warn!("[openclaw_chat] step a: activate failed: {}", e),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        if openclaw_has_window() {
+            log::info!("[openclaw_chat] step a succeeded: activate brought an existing window to front");
+            return Ok("a: activate".into());
+        }
+        log::info!("[openclaw_chat] step a: app running but no window; trying step b");
+    } else {
+        log::info!("[openclaw_chat] step a skipped: OpenClaw not running, launching with --chat");
     }
 
-    // Step b: relaunch with --chat (the app opens its chat window for this flag).
+    // Step b: (re)launch with --chat (the app opens its chat window for this flag).
     match std::process::Command::new("open").args(["-a", "OpenClaw", "--args", "--chat"]).output() {
         Ok(out) if out.status.success() => {}
         Ok(out) => log::warn!("[openclaw_chat] step b: open --args --chat failed: {}", String::from_utf8_lossy(&out.stderr).trim()),
@@ -9253,7 +9272,9 @@ fn open_openclaw_chat_blocking() -> Result<String, String> {
     }
     // Re-check after 1.5 s; a running app shows the chat window well within
     // that, but a cold launch needs ~10 s on this machine, so keep polling.
-    if wait_for_openclaw_window(1500, 12_000) {
+    // Do not call `open`/`activate` again until a window exists, for the
+    // same not-responding reason as above.
+    if wait_for_openclaw_window(1500, 15_000) {
         let _ = run_osascript(r#"tell application "OpenClaw" to activate"#);
         log::info!("[openclaw_chat] step b succeeded: open -a OpenClaw --args --chat opened a window");
         return Ok("b: open --args --chat".into());
