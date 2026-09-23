@@ -9216,6 +9216,136 @@ fn prompt_accessibility_permission() {
     }
 }
 
+/// After the chat window is up: click the top row of OpenClaw's Sessions
+/// sidebar, which the app sorts by recency, so the most recent chat is shown
+/// instead of whatever session was open last. Needs Accessibility for
+/// oc-claw. Returns the selected row's text; on failure it logs a compact
+/// dump of the window's accessibility tree so the selector can be adjusted.
+#[cfg(target_os = "macos")]
+fn select_most_recent_openclaw_session() -> Result<String, String> {
+    if !check_accessibility_permission() {
+        prompt_accessibility_permission();
+        let msg = "most-recent-session selection needs Accessibility permission for oc-claw (System Settings > Privacy & Security > Accessibility)";
+        log::warn!("[openclaw_chat] {}", msg);
+        return Err(msg.into());
+    }
+    let script = r#"
+on rowText(el)
+    set txt to ""
+    try
+        set txt to (value of el) as text
+    end try
+    if txt is "" then
+        try
+            set txt to (name of el) as text
+        end try
+    end if
+    if txt is "" then
+        try
+            set inner to entire contents of el
+            repeat with sub in inner
+                if role of sub is "AXStaticText" then
+                    try
+                        set v to (value of sub) as text
+                        if v is not "" then
+                            set txt to v
+                            exit repeat
+                        end if
+                    end try
+                end if
+            end repeat
+        end try
+    end if
+    return txt
+end rowText
+
+tell application "System Events"
+    tell process "OpenClaw"
+        set frontmost to true
+        set win to window 1
+        set els to entire contents of win
+        set target to missing value
+        set targetText to ""
+        repeat with el in els
+            if role of el is "AXRow" then
+                set t to my rowText(el)
+                ignoring case
+                    if t is not "" and t is not "sessions" and t does not contain "all sessions" then
+                        set target to el
+                        set targetText to t
+                        exit repeat
+                    end if
+                end ignoring
+            end if
+        end repeat
+        if target is missing value then error "no session row found in window 1"
+        try
+            select target
+        on error
+            click target
+        end try
+        return targetText
+    end tell
+end tell
+"#;
+    match run_osascript(script) {
+        Ok(name) => {
+            log::info!("[openclaw_chat] selected most recent session row: {}", name);
+            Ok(name)
+        }
+        Err(e) => {
+            log::warn!("[openclaw_chat] session row selection failed: {}", e);
+            let dump = r#"
+tell application "System Events"
+    tell process "OpenClaw"
+        set out to ""
+        set n to 0
+        repeat with el in entire contents of window 1
+            set r to ""
+            try
+                set r to role of el
+            end try
+            if r is in {"AXRow", "AXOutline", "AXTable", "AXList", "AXGroup", "AXStaticText", "AXButton", "AXScrollArea", "AXSplitGroup"} then
+                set nm to ""
+                try
+                    set nm to (name of el) as text
+                end try
+                set v to ""
+                try
+                    set v to (value of el) as text
+                end try
+                set out to out & r & "|" & nm & "|" & v & linefeed
+                set n to n + 1
+                if n is greater than or equal to 120 then exit repeat
+            end if
+        end repeat
+        return out
+    end tell
+end tell
+"#;
+            match run_osascript(dump) {
+                Ok(tree) => {
+                    let trimmed: String = tree.chars().take(6000).collect();
+                    log::warn!("[openclaw_chat] AX tree of OpenClaw window 1 (first 120 relevant nodes):\n{}", trimmed);
+                }
+                Err(de) => log::warn!("[openclaw_chat] AX dump failed: {}", de),
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Common tail for the success paths: give the window a moment, then try to
+/// select the most recent session. Selection problems never fail the click.
+#[cfg(target_os = "macos")]
+fn finish_with_recent_session(step: &str) -> String {
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    match select_most_recent_openclaw_session() {
+        Ok(name) => format!("{} + selected session '{}'", step, name),
+        Err(e) => format!("{} (session selection skipped: {})", step, e),
+    }
+}
+
 /// Bring the OpenClaw chat window to the front. Returns a short description
 /// of the step that succeeded, or an error naming what was tried.
 #[tauri::command]
@@ -9257,7 +9387,7 @@ fn open_openclaw_chat_blocking() -> Result<String, String> {
         std::thread::sleep(std::time::Duration::from_millis(300));
         if openclaw_has_window() {
             log::info!("[openclaw_chat] step a succeeded: activate brought an existing window to front");
-            return Ok("a: activate".into());
+            return Ok(finish_with_recent_session("a: activate"));
         }
         log::info!("[openclaw_chat] step a: app running but no window; trying step b");
     } else {
@@ -9277,7 +9407,7 @@ fn open_openclaw_chat_blocking() -> Result<String, String> {
     if wait_for_openclaw_window(1500, 15_000) {
         let _ = run_osascript(r#"tell application "OpenClaw" to activate"#);
         log::info!("[openclaw_chat] step b succeeded: open -a OpenClaw --args --chat opened a window");
-        return Ok("b: open --args --chat".into());
+        return Ok(finish_with_recent_session("b: open --args --chat"));
     }
 
     // Step c: UI-script the status item → "Open Chat…".
@@ -9312,7 +9442,7 @@ end tell
     let _ = run_osascript(r#"tell application "OpenClaw" to activate"#);
     if wait_for_openclaw_window(1000, 5_000) {
         log::info!("[openclaw_chat] step c succeeded: status-item Open Chat menu item");
-        return Ok("c: status item > Open Chat".into());
+        return Ok(finish_with_recent_session("c: status item > Open Chat"));
     }
     log::warn!("[openclaw_chat] all steps ran but no OpenClaw window is visible");
     Err("all steps ran but no OpenClaw window is visible".into())
