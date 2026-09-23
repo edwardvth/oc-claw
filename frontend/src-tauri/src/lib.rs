@@ -9073,9 +9073,15 @@ async fn open_url(url: String) -> Result<(), String> {
 // is not always enough. Steps, stopping at the first that yields a visible
 // OpenClaw window:
 //   a. `tell application "OpenClaw" to activate`, then check for a window
-//   b. `open -a OpenClaw --args --chat`, wait 1.5 s, re-check
-//   c. UI-script the status item (menu bar 2) → "Open Chat…" menu item.
-//      Requires Accessibility permission for oc-claw; if missing, prompt once.
+//   b. `open -a OpenClaw --args --chat`, wait 1.5 s (polling), re-check
+//   c. press the status item (extras menu bar) → "Open Chat…" menu item
+// then, once a window is up, select the top row of the Sessions sidebar
+// (OpenClaw sorts it by recency) so the most recent chat is shown.
+//
+// Everything that needs Accessibility talks to the AX API in-process. macOS
+// grants Accessibility to oc-claw's own code signature; a spawned `osascript`
+// child is checked separately and gets refused ("osascript is not allowed
+// assistive access"), which is why System Events scripting is not used here.
 
 #[cfg(target_os = "macos")]
 fn run_osascript(script: &str) -> Result<String, String> {
@@ -9090,9 +9096,143 @@ fn run_osascript(script: &str) -> Result<String, String> {
     }
 }
 
+/// Minimal in-process wrappers over the macOS Accessibility (AX) C API.
+#[cfg(target_os = "macos")]
+mod ax {
+    use std::ffi::c_void;
+    pub type Ref = *const c_void;
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn AXUIElementCreateApplication(pid: i32) -> Ref;
+        fn AXUIElementCopyAttributeValue(el: Ref, attr: Ref, out: *mut Ref) -> i32;
+        fn AXUIElementSetAttributeValue(el: Ref, attr: Ref, value: Ref) -> i32;
+        fn AXUIElementPerformAction(el: Ref, action: Ref) -> i32;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFStringCreateWithCString(alloc: Ref, c: *const u8, enc: u32) -> Ref;
+        fn CFStringGetCString(s: Ref, buf: *mut u8, size: isize, enc: u32) -> bool;
+        fn CFArrayGetCount(a: Ref) -> isize;
+        fn CFArrayGetValueAtIndex(a: Ref, i: isize) -> Ref;
+        fn CFGetTypeID(cf: Ref) -> usize;
+        fn CFStringGetTypeID() -> usize;
+        fn CFArrayGetTypeID() -> usize;
+        fn CFRetain(cf: Ref) -> Ref;
+        fn CFRelease(cf: Ref);
+        static kCFBooleanTrue: Ref;
+    }
+    const UTF8: u32 = 0x0800_0100;
+
+    fn cfstr(s: &str) -> Ref {
+        let c = std::ffi::CString::new(s).unwrap_or_default();
+        unsafe { CFStringCreateWithCString(std::ptr::null(), c.as_ptr() as *const u8, UTF8) }
+    }
+
+    fn cf_to_string(s: Ref) -> Option<String> {
+        if s.is_null() { return None; }
+        unsafe {
+            if CFGetTypeID(s) != CFStringGetTypeID() { return None; }
+            let mut buf = vec![0u8; 2048];
+            if !CFStringGetCString(s, buf.as_mut_ptr(), buf.len() as isize, UTF8) { return None; }
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            Some(String::from_utf8_lossy(&buf[..end]).to_string())
+        }
+    }
+
+    pub fn app(pid: i32) -> Ref { unsafe { AXUIElementCreateApplication(pid) } }
+
+    pub fn release(el: Ref) { if !el.is_null() { unsafe { CFRelease(el) } } }
+
+    /// Copy an attribute; caller releases a non-null result.
+    pub fn attr(el: Ref, name: &str) -> Ref {
+        let k = cfstr(name);
+        let mut out: Ref = std::ptr::null();
+        let rc = unsafe { AXUIElementCopyAttributeValue(el, k, &mut out) };
+        unsafe { CFRelease(k) };
+        if rc != 0 { std::ptr::null() } else { out }
+    }
+
+    pub fn attr_string(el: Ref, name: &str) -> String {
+        let v = attr(el, name);
+        let s = cf_to_string(v).unwrap_or_default();
+        release(v);
+        s
+    }
+
+    /// Array-valued attribute as retained element refs; caller releases each.
+    pub fn attr_list(el: Ref, name: &str) -> Vec<Ref> {
+        let arr = attr(el, name);
+        let mut v = Vec::new();
+        if arr.is_null() { return v; }
+        unsafe {
+            if CFGetTypeID(arr) == CFArrayGetTypeID() {
+                let n = CFArrayGetCount(arr);
+                for i in 0..n {
+                    let c = CFArrayGetValueAtIndex(arr, i);
+                    if !c.is_null() { v.push(CFRetain(c)); }
+                }
+            }
+            CFRelease(arr);
+        }
+        v
+    }
+
+    pub fn children(el: Ref) -> Vec<Ref> { attr_list(el, "AXChildren") }
+
+    pub fn action(el: Ref, name: &str) -> bool {
+        let a = cfstr(name);
+        let rc = unsafe { AXUIElementPerformAction(el, a) };
+        unsafe { CFRelease(a) };
+        rc == 0
+    }
+
+    pub fn set_selected(el: Ref) -> bool {
+        let k = cfstr("AXSelected");
+        let rc = unsafe { AXUIElementSetAttributeValue(el, k, kCFBooleanTrue) };
+        unsafe { CFRelease(k) };
+        rc == 0
+    }
+
+    /// First non-empty AXStaticText value/title in the subtree (bounded).
+    pub fn first_text(el: Ref, max_depth: usize) -> String {
+        let mut queue: Vec<(Ref, usize)> = vec![(unsafe { CFRetain(el) }, 0)];
+        let mut visited = 0usize;
+        let mut found = String::new();
+        while let Some((node, depth)) = queue.pop() {
+            visited += 1;
+            if visited > 400 { release(node); break; }
+            let role = attr_string(node, "AXRole");
+            if role == "AXStaticText" {
+                let v = attr_string(node, "AXValue");
+                let t = if v.trim().is_empty() { attr_string(node, "AXTitle") } else { v };
+                if !t.trim().is_empty() { found = t.trim().to_string(); release(node); break; }
+            }
+            if depth < max_depth {
+                let kids = children(node);
+                for k in kids.into_iter().rev() { queue.push((k, depth + 1)); }
+            }
+            release(node);
+        }
+        for (n, _) in queue { release(n); }
+        found
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn openclaw_pid() -> Option<i32> {
+    let out = std::process::Command::new("pgrep").args(["-x", "OpenClaw"]).output().ok()?;
+    if !out.status.success() { return None; }
+    String::from_utf8_lossy(&out.stdout).lines().next().and_then(|l| l.trim().parse().ok())
+}
+
+/// Is an OpenClaw.app process running?
+#[cfg(target_os = "macos")]
+fn openclaw_is_running() -> bool { openclaw_pid().is_some() }
+
 /// Count OpenClaw's regular on-screen windows via CoreGraphics. This does
-/// not need Accessibility permission, unlike System Events. Status-item and
-/// other overlay windows live on non-zero layers and are ignored.
+/// not need Accessibility permission. Status-item and other overlay windows
+/// live on non-zero layers and are ignored.
 #[cfg(target_os = "macos")]
 fn openclaw_window_count_cg() -> usize {
     use std::ffi::c_void;
@@ -9144,23 +9284,26 @@ fn openclaw_window_count_cg() -> usize {
     }
 }
 
-/// Does OpenClaw currently have at least one window? Asks System Events
-/// first (as specified); if that fails because oc-claw lacks assistive
-/// access, falls back to the CoreGraphics window list.
+/// Does OpenClaw currently have at least one window? Uses the AX window list
+/// when oc-claw has Accessibility (counts windows on any Space), otherwise the
+/// CoreGraphics on-screen list.
 #[cfg(target_os = "macos")]
 fn openclaw_has_window() -> bool {
-    match run_osascript(r#"tell application "System Events" to tell process "OpenClaw" to count windows"#) {
-        Ok(v) => {
-            let n = v.trim().parse::<usize>().unwrap_or(0);
-            log::info!("[openclaw_chat] System Events window count = {}", n);
-            n > 0
+    if check_accessibility_permission() {
+        if let Some(pid) = openclaw_pid() {
+            let app = ax::app(pid);
+            let wins = ax::attr_list(app, "AXWindows");
+            let n = wins.len();
+            for w in wins { ax::release(w); }
+            ax::release(app);
+            log::info!("[openclaw_chat] AX window count = {}", n);
+            return n > 0;
         }
-        Err(e) => {
-            let n = openclaw_window_count_cg();
-            log::info!("[openclaw_chat] System Events check failed ({}); CoreGraphics window count = {}", e, n);
-            n > 0
-        }
+        return false;
     }
+    let n = openclaw_window_count_cg();
+    log::info!("[openclaw_chat] no Accessibility; CoreGraphics window count = {}", n);
+    n > 0
 }
 
 /// Poll for an OpenClaw window: first check after `first_ms`, then every
@@ -9216,11 +9359,46 @@ fn prompt_accessibility_permission() {
     }
 }
 
-/// After the chat window is up: click the top row of OpenClaw's Sessions
+/// Step c: press OpenClaw's status item and its "Open Chat…" menu entry via AX.
+#[cfg(target_os = "macos")]
+fn ax_open_chat_via_status_item() -> Result<(), String> {
+    let pid = openclaw_pid().ok_or("OpenClaw not running")?;
+    let app = ax::app(pid);
+    let extras = ax::attr(app, "AXExtrasMenuBar");
+    if extras.is_null() { ax::release(app); return Err("OpenClaw has no status item (AXExtrasMenuBar)".into()); }
+    let items = ax::children(extras);
+    let Some(&item) = items.first() else {
+        ax::release(extras); ax::release(app);
+        return Err("status item has no menu bar items".into());
+    };
+    if !ax::action(item, "AXPress") {
+        for i in items { ax::release(i); } ax::release(extras); ax::release(app);
+        return Err("could not press the status item".into());
+    }
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let mut result = Err("no menu item starting with \"Open Chat\" in the status menu".to_string());
+    for menu in ax::children(item) {
+        for entry in ax::children(menu) {
+            let title = ax::attr_string(entry, "AXTitle");
+            if result.is_err() && title.starts_with("Open Chat") {
+                if ax::action(entry, "AXPress") { result = Ok(()); } else { result = Err(format!("AXPress on '{}' failed", title)); }
+            }
+            ax::release(entry);
+        }
+        if result.is_err() { ax::action(menu, "AXCancel"); }
+        ax::release(menu);
+    }
+    for i in items { ax::release(i); }
+    ax::release(extras);
+    ax::release(app);
+    result
+}
+
+/// After the chat window is up: select the top row of OpenClaw's Sessions
 /// sidebar, which the app sorts by recency, so the most recent chat is shown
-/// instead of whatever session was open last. Needs Accessibility for
-/// oc-claw. Returns the selected row's text; on failure it logs a compact
-/// dump of the window's accessibility tree so the selector can be adjusted.
+/// instead of whatever session was open last. Needs Accessibility for oc-claw.
+/// Returns the selected row's text; on failure logs a compact map of the
+/// window's AX tree so the selector can be adjusted.
 #[cfg(target_os = "macos")]
 fn select_most_recent_openclaw_session() -> Result<String, String> {
     if !check_accessibility_permission() {
@@ -9229,110 +9407,58 @@ fn select_most_recent_openclaw_session() -> Result<String, String> {
         log::warn!("[openclaw_chat] {}", msg);
         return Err(msg.into());
     }
-    let script = r#"
-on rowText(el)
-    set txt to ""
-    try
-        set txt to (value of el) as text
-    end try
-    if txt is "" then
-        try
-            set txt to (name of el) as text
-        end try
-    end if
-    if txt is "" then
-        try
-            set inner to entire contents of el
-            repeat with sub in inner
-                if role of sub is "AXStaticText" then
-                    try
-                        set v to (value of sub) as text
-                        if v is not "" then
-                            set txt to v
-                            exit repeat
-                        end if
-                    end try
-                end if
-            end repeat
-        end try
-    end if
-    return txt
-end rowText
+    let pid = openclaw_pid().ok_or("OpenClaw not running")?;
+    let app = ax::app(pid);
+    let wins = ax::attr_list(app, "AXWindows");
+    if wins.is_empty() { ax::release(app); return Err("OpenClaw has no AX windows".into()); }
+    // Prefer the window titled "OpenClaw" (the chat window) over settings/dashboard.
+    let mut win = wins[0];
+    for &w in &wins {
+        if ax::attr_string(w, "AXTitle") == "OpenClaw" { win = w; break; }
+    }
+    ax::action(win, "AXRaise");
 
-tell application "System Events"
-    tell process "OpenClaw"
-        set frontmost to true
-        set win to window 1
-        set els to entire contents of win
-        set target to missing value
-        set targetText to ""
-        repeat with el in els
-            if role of el is "AXRow" then
-                set t to my rowText(el)
-                ignoring case
-                    if t is not "" and t is not "sessions" and t does not contain "all sessions" then
-                        set target to el
-                        set targetText to t
-                        exit repeat
-                    end if
-                end ignoring
-            end if
-        end repeat
-        if target is missing value then error "no session row found in window 1"
-        try
-            select target
-        on error
-            click target
-        end try
-        return targetText
-    end tell
-end tell
-"#;
-    match run_osascript(script) {
-        Ok(name) => {
-            log::info!("[openclaw_chat] selected most recent session row: {}", name);
-            Ok(name)
-        }
-        Err(e) => {
-            log::warn!("[openclaw_chat] session row selection failed: {}", e);
-            let dump = r#"
-tell application "System Events"
-    tell process "OpenClaw"
-        set out to ""
-        set n to 0
-        repeat with el in entire contents of window 1
-            set r to ""
-            try
-                set r to role of el
-            end try
-            if r is in {"AXRow", "AXOutline", "AXTable", "AXList", "AXGroup", "AXStaticText", "AXButton", "AXScrollArea", "AXSplitGroup"} then
-                set nm to ""
-                try
-                    set nm to (name of el) as text
-                end try
-                set v to ""
-                try
-                    set v to (value of el) as text
-                end try
-                set out to out & r & "|" & nm & "|" & v & linefeed
-                set n to n + 1
-                if n is greater than or equal to 120 then exit repeat
-            end if
-        end repeat
-        return out
-    end tell
-end tell
-"#;
-            match run_osascript(dump) {
-                Ok(tree) => {
-                    let trimmed: String = tree.chars().take(6000).collect();
-                    log::warn!("[openclaw_chat] AX tree of OpenClaw window 1 (first 120 relevant nodes):\n{}", trimmed);
-                }
-                Err(de) => log::warn!("[openclaw_chat] AX dump failed: {}", de),
+    // Bounded BFS over the window for AXRow elements (sidebar rows); skip
+    // header/footer rows. First qualifying row = most recent session.
+    let mut queue: Vec<(ax::Ref, usize)> = vec![(win, 0)];
+    let mut head = 0usize;
+    let mut visited = 0usize;
+    let mut dump: Vec<String> = Vec::new();
+    let mut result: Result<String, String> = Err("no session row found in the OpenClaw window".into());
+    let skip_roles = ["AXStaticText", "AXImage", "AXButton", "AXTextArea", "AXTextField", "AXMenuButton", "AXPopUpButton"];
+    while head < queue.len() && visited < 5000 {
+        let (node, depth) = queue[head];
+        head += 1;
+        visited += 1;
+        let role = ax::attr_string(node, "AXRole");
+        if dump.len() < 150 && depth <= 12 {
+            let title = ax::attr_string(node, "AXTitle");
+            let value = ax::attr_string(node, "AXValue");
+            if role != "AXStaticText" || !value.is_empty() {
+                dump.push(format!("{}{}|{}|{}", " ".repeat(depth), role, title.chars().take(40).collect::<String>(), value.chars().take(40).collect::<String>()));
             }
-            Err(e)
+        }
+        if role == "AXRow" {
+            let text = ax::first_text(node, 5);
+            let lower = text.to_lowercase();
+            if !text.is_empty() && lower != "sessions" && !lower.contains("all sessions") {
+                let ok = ax::action(node, "AXPress") || ax::set_selected(node) || ax::action(node, "AXConfirm");
+                result = if ok { Ok(text) } else { Err(format!("found row '{}' but could not press/select it", text)) };
+                break;
+            }
+        }
+        if depth < 30 && !skip_roles.contains(&role.as_str()) {
+            for k in ax::children(node) { queue.push((k, depth + 1)); }
         }
     }
+    for (i, (n, _)) in queue.iter().enumerate() { if i > 0 { ax::release(*n); } }
+    for w in wins { ax::release(w); }
+    ax::release(app);
+    match &result {
+        Ok(name) => log::info!("[openclaw_chat] selected most recent session row: {} (visited {} nodes)", name, visited),
+        Err(e) => log::warn!("[openclaw_chat] session row selection failed: {} (visited {} nodes)\nAX tree (first {} nodes):\n{}", e, visited, dump.len(), dump.join("\n")),
+    }
+    result
 }
 
 /// Common tail for the success paths: give the window a moment, then try to
@@ -9360,16 +9486,6 @@ async fn open_openclaw_chat() -> Result<String, String> {
             .await
             .map_err(|e| e.to_string())?
     }
-}
-
-/// Is an OpenClaw.app process running?
-#[cfg(target_os = "macos")]
-fn openclaw_is_running() -> bool {
-    std::process::Command::new("pgrep")
-        .args(["-x", "OpenClaw"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }
 
 #[cfg(target_os = "macos")]
@@ -9410,34 +9526,16 @@ fn open_openclaw_chat_blocking() -> Result<String, String> {
         return Ok(finish_with_recent_session("b: open --args --chat"));
     }
 
-    // Step c: UI-script the status item → "Open Chat…".
+    // Step c: status item → "Open Chat…", via the AX API in-process.
     if !check_accessibility_permission() {
         prompt_accessibility_permission();
         let msg = "step c needs Accessibility permission: grant oc-claw access in System Settings > Privacy & Security > Accessibility, then click the mascot again";
         log::warn!("[openclaw_chat] {}", msg);
         return Err(msg.into());
     }
-    let script = r#"
-tell application "System Events"
-    tell process "OpenClaw"
-        set statusItem to menu bar item 1 of menu bar 2
-        click statusItem
-        delay 0.4
-        set chatItems to (menu items of menu 1 of statusItem whose name starts with "Open Chat")
-        if (count of chatItems) is 0 then
-            key code 53
-            error "no menu item starting with \"Open Chat\" in the status menu"
-        end if
-        click item 1 of chatItems
-    end tell
-end tell
-"#;
-    match run_osascript(script) {
-        Ok(_) => {}
-        Err(e) => {
-            log::warn!("[openclaw_chat] step c: status-item scripting failed: {}", e);
-            return Err(format!("step c failed: {}", e));
-        }
+    if let Err(e) = ax_open_chat_via_status_item() {
+        log::warn!("[openclaw_chat] step c: status-item AX scripting failed: {}", e);
+        return Err(format!("step c failed: {}", e));
     }
     let _ = run_osascript(r#"tell application "OpenClaw" to activate"#);
     if wait_for_openclaw_window(1000, 5_000) {
