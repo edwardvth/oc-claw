@@ -105,9 +105,6 @@ interface UpdateProgressPayload {
 
 const MAX_SLOTS = 10
 const MASCOT_SCALE_MIN = 1
-// Deep link opened when the collapsed coding-mode mascot is clicked and the
-// `click_mascot_opens_openclaw` setting is on (handled by the OpenClaw Mac app).
-const OPENCLAW_DASHBOARD_URL = 'openclaw://dashboard'
 const MASCOT_SCALE_MAX = 3
 const MASCOT_BASE_SIZE = 43
 // Codex sprite-pets render very small at the legacy mascot size (192x208
@@ -2378,10 +2375,12 @@ export default function Mini() {
   // at pointerup. `dragged` flips when the Rust poll reports horizontal
   // movement (mini-mascot-walk) or the pointer travelled past the threshold.
   const macClickPendingRef = useRef<{ x: number; y: number; dragged: boolean } | null>(null)
-  const openOpenclawDashboard = useCallback(() => {
-    invoke('open_url', { url: OPENCLAW_DASHBOARD_URL }).catch((e) => {
-      console.warn('[mini] open openclaw dashboard failed:', e)
-    })
+  // Bring the OpenClaw chat window to the front (Rust `open_openclaw_chat`:
+  // activate → `open -a OpenClaw --args --chat` → status-item "Open Chat").
+  const openOpenclawChat = useCallback(() => {
+    invoke<string>('open_openclaw_chat')
+      .then((step) => console.info('[mini] openclaw chat opened via', step))
+      .catch((e) => console.warn('[mini] open openclaw chat failed:', e))
   }, [])
   const autoCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Refs to keep the listener stable while we still respect live toggle changes.
@@ -3127,7 +3126,7 @@ export default function Mini() {
               done()
               if (pending.dragged || moved || collapsingRef.current || moveModeRef.current) return
               if (appModeRef.current === 'pet' || !clickMascotOpensOpenclawRef.current) return
-              openOpenclawDashboard()
+              openOpenclawChat()
             }
             const onCancel = (ev: PointerEvent) => {
               if (ev.pointerId !== pid) return
@@ -3214,7 +3213,7 @@ export default function Mini() {
             // notch detection, so a tap is the only way to open the panel.
             if (isWindowsPlatform) {
               if (clickMascotOpensOpenclawRef.current) {
-                openOpenclawDashboard()
+                openOpenclawChat()
               } else {
                 hoverExpandedRef.current = false
                 setCompletionSessionId(null)
@@ -3469,7 +3468,7 @@ export default function Mini() {
       window.addEventListener('pointerup', onUp)
       window.addEventListener('pointercancel', onCancel)
     },
-    [expand, updateWalkDir, cancelFocusExpand, openOpenclawDashboard],
+    [expand, updateWalkDir, cancelFocusExpand, openOpenclawChat],
   )
 
   const collapse = useCallback(async () => {

@@ -9066,6 +9066,237 @@ async fn open_url(url: String) -> Result<(), String> {
     Ok(())
 }
 
+// ─── OpenClaw chat window activation ───
+//
+// Used by the "click mascot opens OpenClaw" feature. OpenClaw is a menu-bar
+// (LSUIElement) app whose chat window may be closed, so a plain `activate`
+// is not always enough. Steps, stopping at the first that yields a visible
+// OpenClaw window:
+//   a. `tell application "OpenClaw" to activate`, then check for a window
+//   b. `open -a OpenClaw --args --chat`, wait 1.5 s, re-check
+//   c. UI-script the status item (menu bar 2) → "Open Chat…" menu item.
+//      Requires Accessibility permission for oc-claw; if missing, prompt once.
+
+#[cfg(target_os = "macos")]
+fn run_osascript(script: &str) -> Result<String, String> {
+    let out = std::process::Command::new("osascript")
+        .args(["-e", script])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// Count OpenClaw's regular on-screen windows via CoreGraphics. This does
+/// not need Accessibility permission, unlike System Events. Status-item and
+/// other overlay windows live on non-zero layers and are ignored.
+#[cfg(target_os = "macos")]
+fn openclaw_window_count_cg() -> usize {
+    use std::ffi::c_void;
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGWindowListCopyWindowInfo(option: u32, relative_to: u32) -> *const c_void;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFArrayGetCount(arr: *const c_void) -> isize;
+        fn CFArrayGetValueAtIndex(arr: *const c_void, idx: isize) -> *const c_void;
+        fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
+        fn CFStringCreateWithCString(alloc: *const c_void, c_str: *const u8, encoding: u32) -> *const c_void;
+        fn CFStringGetCString(s: *const c_void, buf: *mut u8, size: isize, encoding: u32) -> bool;
+        fn CFNumberGetValue(n: *const c_void, ty: isize, out: *mut c_void) -> bool;
+        fn CFRelease(cf: *const c_void);
+    }
+    const UTF8: u32 = 0x0800_0100;
+    const ON_SCREEN_ONLY: u32 = 1 << 0;
+    const EXCLUDE_DESKTOP: u32 = 1 << 4;
+    const SINT64: isize = 4;
+    unsafe {
+        let list = CGWindowListCopyWindowInfo(ON_SCREEN_ONLY | EXCLUDE_DESKTOP, 0);
+        if list.is_null() { return 0; }
+        let k_owner = CFStringCreateWithCString(std::ptr::null(), b"kCGWindowOwnerName\0".as_ptr(), UTF8);
+        let k_layer = CFStringCreateWithCString(std::ptr::null(), b"kCGWindowLayer\0".as_ptr(), UTF8);
+        let mut count = 0usize;
+        let n = CFArrayGetCount(list);
+        for i in 0..n {
+            let dict = CFArrayGetValueAtIndex(list, i);
+            if dict.is_null() { continue; }
+            let owner = CFDictionaryGetValue(dict, k_owner);
+            if owner.is_null() { continue; }
+            let mut buf = [0u8; 256];
+            if !CFStringGetCString(owner, buf.as_mut_ptr(), buf.len() as isize, UTF8) { continue; }
+            let name = std::ffi::CStr::from_ptr(buf.as_ptr() as *const i8).to_string_lossy();
+            if name != "OpenClaw" { continue; }
+            let layer_ref = CFDictionaryGetValue(dict, k_layer);
+            let mut layer: i64 = 0;
+            if !layer_ref.is_null() {
+                CFNumberGetValue(layer_ref, SINT64, &mut layer as *mut i64 as *mut c_void);
+            }
+            if layer == 0 { count += 1; }
+        }
+        CFRelease(k_owner);
+        CFRelease(k_layer);
+        CFRelease(list);
+        count
+    }
+}
+
+/// Does OpenClaw currently have at least one window? Asks System Events
+/// first (as specified); if that fails because oc-claw lacks assistive
+/// access, falls back to the CoreGraphics window list.
+#[cfg(target_os = "macos")]
+fn openclaw_has_window() -> bool {
+    match run_osascript(r#"tell application "System Events" to tell process "OpenClaw" to count windows"#) {
+        Ok(v) => {
+            let n = v.trim().parse::<usize>().unwrap_or(0);
+            log::info!("[openclaw_chat] System Events window count = {}", n);
+            n > 0
+        }
+        Err(e) => {
+            let n = openclaw_window_count_cg();
+            log::info!("[openclaw_chat] System Events check failed ({}); CoreGraphics window count = {}", e, n);
+            n > 0
+        }
+    }
+}
+
+/// Poll for an OpenClaw window: first check after `first_ms`, then every
+/// 500 ms until `total_ms` has elapsed.
+#[cfg(target_os = "macos")]
+fn wait_for_openclaw_window(first_ms: u64, total_ms: u64) -> bool {
+    let start = std::time::Instant::now();
+    std::thread::sleep(std::time::Duration::from_millis(first_ms));
+    loop {
+        if openclaw_has_window() { return true; }
+        if start.elapsed().as_millis() as u64 >= total_ms { return false; }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn prompt_accessibility_permission() {
+    use std::ffi::c_void;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFStringCreateWithCString(alloc: *const c_void, c_str: *const u8, encoding: u32) -> *const c_void;
+        fn CFDictionaryCreate(
+            alloc: *const c_void, keys: *const *const c_void, values: *const *const c_void,
+            count: isize, key_cbs: *const c_void, val_cbs: *const c_void,
+        ) -> *const c_void;
+        fn CFRelease(cf: *const c_void);
+        static kCFTypeDictionaryKeyCallBacks: c_void;
+        static kCFTypeDictionaryValueCallBacks: c_void;
+        static kCFBooleanTrue: *const c_void;
+    }
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn AXIsProcessTrustedWithOptions(options: *const c_void) -> bool;
+    }
+
+    unsafe {
+        let key = CFStringCreateWithCString(
+            std::ptr::null(),
+            b"AXTrustedCheckOptionPrompt\0".as_ptr(),
+            0x08000100, // kCFStringEncodingUTF8
+        );
+        let keys = [key];
+        let values = [kCFBooleanTrue];
+        let dict = CFDictionaryCreate(
+            std::ptr::null(), keys.as_ptr(), values.as_ptr(), 1,
+            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks,
+        );
+        AXIsProcessTrustedWithOptions(dict);
+        CFRelease(dict);
+        CFRelease(key);
+    }
+}
+
+/// Bring the OpenClaw chat window to the front. Returns a short description
+/// of the step that succeeded, or an error naming what was tried.
+#[tauri::command]
+async fn open_openclaw_chat() -> Result<String, String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        return Err("open_openclaw_chat is only supported on macOS".into());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        tokio::task::spawn_blocking(open_openclaw_chat_blocking)
+            .await
+            .map_err(|e| e.to_string())?
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_openclaw_chat_blocking() -> Result<String, String> {
+    // Step a: plain activate.
+    match run_osascript(r#"tell application "OpenClaw" to activate"#) {
+        Ok(_) => {}
+        Err(e) => log::warn!("[openclaw_chat] step a: activate failed: {}", e),
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    if openclaw_has_window() {
+        log::info!("[openclaw_chat] step a succeeded: activate brought an existing window to front");
+        return Ok("a: activate".into());
+    }
+
+    // Step b: relaunch with --chat (the app opens its chat window for this flag).
+    match std::process::Command::new("open").args(["-a", "OpenClaw", "--args", "--chat"]).output() {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => log::warn!("[openclaw_chat] step b: open --args --chat failed: {}", String::from_utf8_lossy(&out.stderr).trim()),
+        Err(e) => log::warn!("[openclaw_chat] step b: could not run open: {}", e),
+    }
+    // Re-check after 1.5 s; a running app shows the chat window well within
+    // that, but a cold launch needs ~10 s on this machine, so keep polling.
+    if wait_for_openclaw_window(1500, 12_000) {
+        let _ = run_osascript(r#"tell application "OpenClaw" to activate"#);
+        log::info!("[openclaw_chat] step b succeeded: open -a OpenClaw --args --chat opened a window");
+        return Ok("b: open --args --chat".into());
+    }
+
+    // Step c: UI-script the status item → "Open Chat…".
+    if !check_accessibility_permission() {
+        prompt_accessibility_permission();
+        let msg = "step c needs Accessibility permission: grant oc-claw access in System Settings > Privacy & Security > Accessibility, then click the mascot again";
+        log::warn!("[openclaw_chat] {}", msg);
+        return Err(msg.into());
+    }
+    let script = r#"
+tell application "System Events"
+    tell process "OpenClaw"
+        set statusItem to menu bar item 1 of menu bar 2
+        click statusItem
+        delay 0.4
+        set chatItems to (menu items of menu 1 of statusItem whose name starts with "Open Chat")
+        if (count of chatItems) is 0 then
+            key code 53
+            error "no menu item starting with \"Open Chat\" in the status menu"
+        end if
+        click item 1 of chatItems
+    end tell
+end tell
+"#;
+    match run_osascript(script) {
+        Ok(_) => {}
+        Err(e) => {
+            log::warn!("[openclaw_chat] step c: status-item scripting failed: {}", e);
+            return Err(format!("step c failed: {}", e));
+        }
+    }
+    let _ = run_osascript(r#"tell application "OpenClaw" to activate"#);
+    if wait_for_openclaw_window(1000, 5_000) {
+        log::info!("[openclaw_chat] step c succeeded: status-item Open Chat menu item");
+        return Ok("c: status item > Open Chat".into());
+    }
+    log::warn!("[openclaw_chat] all steps ran but no OpenClaw window is visible");
+    Err("all steps ran but no OpenClaw window is visible".into())
+}
+
 #[derive(Debug, Serialize)]
 pub struct CodexPetMeta {
     pub id: String,
@@ -17489,7 +17720,7 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, get_claude_stats, open_url, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs])
+        .invoke_handler(tauri::generate_handler![get_status, send_chat, open_detail_panel, save_character_gif, delete_character_assets, delete_character_gif, get_agents, get_health, get_agent_metrics, interrupt_agent, scan_characters, get_agent_extra_info, open_mini, close_mini, set_mini_expanded, set_mini_size, set_efficiency_hover_tracking, cursor_over_mini_window, set_outside_click_watch, resize_mini_height, move_mini_by, get_mini_origin, get_mini_monitor_rect, set_mini_origin, set_ime_mode, get_agent_sessions, get_session_preview, get_session_messages, get_active_sessions, proxy_post, play_sound, get_claude_sessions, get_claude_conversation, install_claude_hooks, install_codex_hooks, install_cursor_hooks, install_gemini_hooks, install_opencode_hooks, install_hermes_hooks, test_hermes_hook, install_hermes_remote_plugin, get_hermes_remote_stats, get_hermes_remote_sessions, get_hermes_sessions_summary, get_hermes_recent_activity, get_hermes_remote_recent_activity, test_hermes_ssh, remove_claude_session, resolve_claude_permission, get_claude_stats, open_url, open_openclaw_chat, activate_app, focus_cursor_terminal, check_ax_permission, request_ax_permission, jump_to_claude_terminal, check_for_update, run_update, close_ssh, read_local_file, list_backgrounds, save_background, get_background_data, exit_app, get_ssh_key_info, reset_ssh, get_ui_scale, list_custom_codex_pets, open_codex_pets_dir, import_codex_pet, pick_codex_pet_folder, reassert_floating, spawn_demo_mascot, close_demo_mascot, close_demo_mascots, spawn_extra_mascot, close_extra_mascot, close_extra_mascots, list_extra_mascots, set_extra_mascots_hidden, debug_log, update_tray_language, set_pet_mode_window, set_pet_context_menu, set_pet_pomodoro_active, get_now_playing, get_system_idle_time, get_keyboard_idle_secs])
         .manage(ActiveAgentPid { pid: Mutex::new(None) })
         .manage(ClaudeState { sessions: Arc::new(Mutex::new(HashMap::new())), pending_permissions: Arc::new(Mutex::new(HashMap::new())), dismissed: Arc::new(Mutex::new(std::collections::HashSet::new())) })
         .run(tauri::generate_context!())

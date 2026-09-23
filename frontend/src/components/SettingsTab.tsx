@@ -1234,7 +1234,7 @@ export function SettingsTab({ notifySound, onChangeNotifySound, waitingSound, on
             <div className="flex items-center justify-between p-4 border-b border-white/5">
               <div className="flex flex-col gap-1">
                 <span className="text-sm font-medium text-white/90">{t('settings.clickMascotOpensOpenclaw', 'Click Mascot Opens OpenClaw')}</span>
-                <span className="text-xs text-white/40">{t('settings.clickMascotOpensOpenclawDesc', 'Single click on the mascot opens the OpenClaw app (openclaw://dashboard); hover still expands the panel')}</span>
+                <span className="text-xs text-white/40">{t('settings.clickMascotOpensOpenclawDesc', 'Single click on the mascot brings the OpenClaw chat window to the front; hover still expands the panel')}</span>
               </div>
               <Toggle checked={clickMascotOpensOpenclaw ?? true} onChange={onToggleClickMascotOpensOpenclaw} />
             </div>
