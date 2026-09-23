@@ -105,6 +105,9 @@ interface UpdateProgressPayload {
 
 const MAX_SLOTS = 10
 const MASCOT_SCALE_MIN = 1
+// Deep link opened when the collapsed coding-mode mascot is clicked and the
+// `click_mascot_opens_openclaw` setting is on (handled by the OpenClaw Mac app).
+const OPENCLAW_DASHBOARD_URL = 'openclaw://dashboard'
 const MASCOT_SCALE_MAX = 3
 const MASCOT_BASE_SIZE = 43
 // Codex sprite-pets render very small at the legacy mascot size (192x208
@@ -537,6 +540,9 @@ export default function Mini() {
   const [notifySound, setNotifySound] = useState<'default' | 'manbo'>('default')
   const [waitingSound, setWaitingSound] = useState(false)
   const [autoCloseCompletion, setAutoCloseCompletion] = useState(false)
+  // Single click on the collapsed mascot opens the OpenClaw app instead of
+  // the panel (hover-expand is unaffected). Persisted as `click_mascot_opens_openclaw`.
+  const [clickMascotOpensOpenclaw, setClickMascotOpensOpenclaw] = useState(true)
   const [petSfxEnabled, setPetSfxEnabled] = useState(true)
   const petSfxEnabledRef = useRef(true)
   // Pet mode: random idle action trigger interval, in minutes (0.5 – 30, default 2).
@@ -2102,6 +2108,11 @@ export default function Mini() {
         setAutoExpandOnTask(aet)
         autoExpandOnTaskRef.current = aet
       }
+      const cmo = await store.get('click_mascot_opens_openclaw')
+      if (typeof cmo === 'boolean') {
+        setClickMascotOpensOpenclaw(cmo)
+        clickMascotOpensOpenclawRef.current = cmo
+      }
       const lm = await store.get('large_mascot')
       if (typeof lm === 'boolean' && appModeRef.current !== 'pet') {
         setLargeMascot(lm)
@@ -2361,6 +2372,17 @@ export default function Mini() {
   autoCloseCompletionRef.current = autoCloseCompletion
   const autoExpandOnTaskRef = useRef(autoExpandOnTask)
   autoExpandOnTaskRef.current = autoExpandOnTask
+  const clickMascotOpensOpenclawRef = useRef(clickMascotOpensOpenclaw)
+  clickMascotOpensOpenclawRef.current = clickMascotOpensOpenclaw
+  // macOS: pending click on the collapsed mascot. Set at pointerdown, cleared
+  // at pointerup. `dragged` flips when the Rust poll reports horizontal
+  // movement (mini-mascot-walk) or the pointer travelled past the threshold.
+  const macClickPendingRef = useRef<{ x: number; y: number; dragged: boolean } | null>(null)
+  const openOpenclawDashboard = useCallback(() => {
+    invoke('open_url', { url: OPENCLAW_DASHBOARD_URL }).catch((e) => {
+      console.warn('[mini] open openclaw dashboard failed:', e)
+    })
+  }, [])
   const autoCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Refs to keep the listener stable while we still respect live toggle changes.
   const enableClaudeCodeRef = useRef(enableClaudeCode)
@@ -3086,6 +3108,34 @@ export default function Mini() {
         // poll for translation + walk-dir + persistence.
         if (!isWindowsPlatform) {
           e.preventDefault()
+          if (clickMascotOpensOpenclawRef.current) {
+            // Detect a plain click (press + release without movement). The
+            // Rust poll owns the drag, so we only watch for movement here:
+            // either a walk-dir event or a pointer travel past the threshold.
+            const pending = { x: e.screenX, y: e.screenY, dragged: false }
+            macClickPendingRef.current = pending
+            const pid = e.pointerId
+            const CLICK_THRESHOLD = 3
+            const done = () => {
+              if (macClickPendingRef.current === pending) macClickPendingRef.current = null
+              window.removeEventListener('pointerup', onUp)
+              window.removeEventListener('pointercancel', onCancel)
+            }
+            const onUp = (ev: PointerEvent) => {
+              if (ev.pointerId !== pid) return
+              const moved = Math.abs(ev.screenX - pending.x) + Math.abs(ev.screenY - pending.y) >= CLICK_THRESHOLD
+              done()
+              if (pending.dragged || moved || collapsingRef.current || moveModeRef.current) return
+              if (appModeRef.current === 'pet' || !clickMascotOpensOpenclawRef.current) return
+              openOpenclawDashboard()
+            }
+            const onCancel = (ev: PointerEvent) => {
+              if (ev.pointerId !== pid) return
+              done()
+            }
+            window.addEventListener('pointerup', onUp)
+            window.addEventListener('pointercancel', onCancel)
+          }
           return
         }
         // The window-focus auto-expand fires slightly before pointerdown
@@ -3163,9 +3213,13 @@ export default function Mini() {
             // so a tap on the mascot stays a no-op there. Windows has no
             // notch detection, so a tap is the only way to open the panel.
             if (isWindowsPlatform) {
-              hoverExpandedRef.current = false
-              setCompletionSessionId(null)
-              expand()
+              if (clickMascotOpensOpenclawRef.current) {
+                openOpenclawDashboard()
+              } else {
+                hoverExpandedRef.current = false
+                setCompletionSessionId(null)
+                expand()
+              }
             }
           } else {
             invoke('get_mini_origin').then(async (pos) => {
@@ -3415,7 +3469,7 @@ export default function Mini() {
       window.addEventListener('pointerup', onUp)
       window.addEventListener('pointercancel', onCancel)
     },
-    [expand, updateWalkDir, cancelFocusExpand],
+    [expand, updateWalkDir, cancelFocusExpand, openOpenclawDashboard],
   )
 
   const collapse = useCallback(async () => {
@@ -3600,6 +3654,7 @@ export default function Mini() {
       if (dir === 1 || dir === -1 || dir === 0) {
         updateWalkDir(dir)
       }
+      if (dir !== 0 && macClickPendingRef.current) macClickPendingRef.current.dragged = true
     })
     return () => {
       unlisten.then((fn) => fn())
@@ -6411,6 +6466,14 @@ export default function Mini() {
                           autoExpandOnTaskRef.current = v
                           const store = await getStore()
                           await store.set('auto_expand_on_task', v)
+                          await store.save()
+                        }}
+                        clickMascotOpensOpenclaw={clickMascotOpensOpenclaw}
+                        onToggleClickMascotOpensOpenclaw={async (v) => {
+                          setClickMascotOpensOpenclaw(v)
+                          clickMascotOpensOpenclawRef.current = v
+                          const store = await getStore()
+                          await store.set('click_mascot_opens_openclaw', v)
                           await store.save()
                         }}
                         islandBg={islandBg}

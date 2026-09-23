@@ -191,6 +191,8 @@
     "autoCloseCompletionDesc": "完成弹窗出现后 5 秒自动关闭",
     "autoExpandOnTask": "主动弹窗",
     "autoExpandOnTaskDesc": "任务完成或需要输入时自动弹出面板",
+    "clickMascotOpensOpenclaw": "点击看板娘打开 OpenClaw",
+    "clickMascotOpensOpenclawDesc": "单击看板娘打开 OpenClaw 应用（openclaw://dashboard），悬停仍会展开面板",
 
     "system": "系统",
     "autostart": "开机启动",

@@ -191,6 +191,8 @@
     "autoCloseCompletionDesc": "Automatically close the completion popup after 5 seconds",
     "autoExpandOnTask": "Auto Popup",
     "autoExpandOnTaskDesc": "Automatically expand panel when a task completes or needs input",
+    "clickMascotOpensOpenclaw": "Click Mascot Opens OpenClaw",
+    "clickMascotOpensOpenclawDesc": "Single click on the mascot opens the OpenClaw app (openclaw://dashboard); hover still expands the panel",
 
     "system": "System",
     "autostart": "Launch on Login",
