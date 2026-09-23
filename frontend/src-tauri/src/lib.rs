@@ -9418,45 +9418,72 @@ fn select_most_recent_openclaw_session() -> Result<String, String> {
     }
     ax::action(win, "AXRaise");
 
-    // Bounded BFS over the window for AXRow elements (sidebar rows); skip
-    // header/footer rows. First qualifying row = most recent session.
-    let mut queue: Vec<(ax::Ref, usize)> = vec![(win, 0)];
-    let mut head = 0usize;
+    // The chat window is a web view. The sidebar lists pinned sessions under
+    // a "PINNED" header, then the recency-sorted list under a "SESSIONS"
+    // header; each entry is an AXLink followed by a time label and a pin
+    // button. Walk the tree in document order (DFS) and press the first link
+    // after the SESSIONS header — that is the most recent session.
+    let mut stack: Vec<(ax::Ref, usize)> = vec![(win, 0)];
     let mut visited = 0usize;
     let mut dump: Vec<String> = Vec::new();
-    let mut result: Result<String, String> = Err("no session row found in the OpenClaw window".into());
-    let skip_roles = ["AXStaticText", "AXImage", "AXButton", "AXTextArea", "AXTextField", "AXMenuButton", "AXPopUpButton"];
-    while head < queue.len() && visited < 5000 {
-        let (node, depth) = queue[head];
-        head += 1;
+    let mut seen_sessions_header = false;
+    let mut in_sessions_group = false;
+    let mut fallback: Option<(ax::Ref, String)> = None;
+    let mut result: Result<String, String> = Err("no session link found after the SESSIONS header".into());
+    let skip_roles = ["AXStaticText", "AXImage", "AXButton", "AXTextArea", "AXTextField", "AXMenuButton", "AXPopUpButton", "AXLink"];
+    let not_sessions = ["all sessions", "openclaw", "settings", "docs", "overview"];
+    while let Some((node, depth)) = stack.pop() {
         visited += 1;
+        if visited > 6000 { if node != win { ax::release(node); } break; }
         let role = ax::attr_string(node, "AXRole");
-        if dump.len() < 150 && depth <= 12 {
-            let title = ax::attr_string(node, "AXTitle");
-            let value = ax::attr_string(node, "AXValue");
-            if role != "AXStaticText" || !value.is_empty() {
-                dump.push(format!("{}{}|{}|{}", " ".repeat(depth), role, title.chars().take(40).collect::<String>(), value.chars().take(40).collect::<String>()));
-            }
+        let title = ax::attr_string(node, "AXTitle");
+        let value = ax::attr_string(node, "AXValue");
+        if dump.len() < 200 && (role != "AXStaticText" || !value.is_empty()) {
+            dump.push(format!("{}{}|{}|{}", " ".repeat(depth), role, title.chars().take(40).collect::<String>(), value.chars().take(40).collect::<String>()));
         }
-        if role == "AXRow" {
-            let text = ax::first_text(node, 5);
+        if role == "AXStaticText" && value.trim().eq_ignore_ascii_case("sessions") {
+            seen_sessions_header = true;
+        }
+        if role == "AXGroup" && title.eq_ignore_ascii_case("sessions") {
+            in_sessions_group = true;
+        }
+        if role == "AXLink" {
+            let text = if !title.trim().is_empty() { title.trim().to_string() } else { ax::first_text(node, 3) };
             let lower = text.to_lowercase();
-            if !text.is_empty() && lower != "sessions" && !lower.contains("all sessions") {
-                let ok = ax::action(node, "AXPress") || ax::set_selected(node) || ax::action(node, "AXConfirm");
-                result = if ok { Ok(text) } else { Err(format!("found row '{}' but could not press/select it", text)) };
+            let plausible = !text.is_empty() && !not_sessions.iter().any(|n| lower == *n);
+            if plausible && seen_sessions_header {
+                let ok = ax::action(node, "AXPress");
+                result = if ok { Ok(text) } else { Err(format!("found link '{}' but AXPress failed", text)) };
+                ax::release(node);
                 break;
             }
+            if plausible && in_sessions_group && fallback.is_none() {
+                fallback = Some((node, text.clone()));
+            }
         }
-        if depth < 30 && !skip_roles.contains(&role.as_str()) {
-            for k in ax::children(node) { queue.push((k, depth + 1)); }
+        if depth < 40 && !skip_roles.contains(&role.as_str()) {
+            let kids = ax::children(node);
+            for k in kids.into_iter().rev() { stack.push((k, depth + 1)); }
         }
+        if node != win && fallback.as_ref().map(|f| f.0 != node).unwrap_or(true) { ax::release(node); }
     }
-    for (i, (n, _)) in queue.iter().enumerate() { if i > 0 { ax::release(*n); } }
+    for (n, _) in stack { if n != win { ax::release(n); } }
+    if result.is_err() {
+        if let Some((link, text)) = fallback.take() {
+            // No SESSIONS header found (layout changed?) — use the first session-looking
+            // link inside the sidebar group instead.
+            let ok = ax::action(link, "AXPress");
+            result = if ok { Ok(format!("{} (fallback: first sidebar link)", text)) } else { Err(format!("fallback link '{}' AXPress failed", text)) };
+            ax::release(link);
+        }
+    } else if let Some((link, _)) = fallback.take() {
+        ax::release(link);
+    }
     for w in wins { ax::release(w); }
     ax::release(app);
     match &result {
         Ok(name) => log::info!("[openclaw_chat] selected most recent session row: {} (visited {} nodes)", name, visited),
-        Err(e) => log::warn!("[openclaw_chat] session row selection failed: {} (visited {} nodes)\nAX tree (first {} nodes):\n{}", e, visited, dump.len(), dump.join("\n")),
+        Err(e) => log::warn!("[openclaw_chat] session selection failed: {} (visited {} nodes)\nAX tree (first {} nodes):\n{}", e, visited, dump.len(), dump.join("\n")),
     }
     result
 }
