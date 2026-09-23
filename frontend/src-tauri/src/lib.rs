@@ -747,15 +747,41 @@ async fn is_remote_session_active(url: &str, token: &str, session_key: &str, s: 
 /// We check: if the last assistant message has "toolCall" content, the turn continues.
 /// Also: if the last message is "toolResult", the agent is about to process it → active.
 /// This affects: pet working/idle animation, completion sound, session active indicator.
+/// Messages older than this are treated as abandoned: an unanswered user
+/// prompt from an hour ago must not keep the agent in the "working" state.
+const AGENT_ACTIVE_MAX_AGE_SECS: i64 = 10 * 60;
+
+/// Parse the timestamp of a session JSONL line. Prefers the top-level ISO 8601
+/// `timestamp` field; falls back to `message.timestamp` (epoch milliseconds).
+fn parse_message_timestamp(val: &serde_json::Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Some(ts) = val["timestamp"].as_str() {
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+            return Some(dt.with_timezone(&chrono::Utc));
+        }
+    }
+    if let Some(ms) = val["message"]["timestamp"].as_i64() {
+        return chrono::DateTime::from_timestamp_millis(ms);
+    }
+    None
+}
+
 fn check_agent_active_from_lines(lines: &[String]) -> bool {
+    check_agent_active_from_lines_at(lines, chrono::Utc::now())
+}
+
+/// Same as [`check_agent_active_from_lines`] with an injectable clock, so the
+/// staleness rule can be unit-tested deterministically.
+fn check_agent_active_from_lines_at(lines: &[String], now: chrono::DateTime<chrono::Utc>) -> bool {
     let mut last_role = String::new();
     let mut has_usage = false;
     let mut has_tool_call = false;
+    let mut last_ts: Option<chrono::DateTime<chrono::Utc>> = None;
     for line in lines.iter().rev() {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
             if val["type"].as_str() == Some("message") {
                 last_role = val["message"]["role"].as_str().unwrap_or("").to_string();
                 has_usage = val["message"]["usage"].is_object();
+                last_ts = parse_message_timestamp(&val);
                 // Check if assistant message contains a toolCall content block
                 if let Some(content) = val["message"]["content"].as_array() {
                     has_tool_call = content.iter().any(|c| c["type"].as_str() == Some("toolCall"));
@@ -771,9 +797,79 @@ fn check_agent_active_from_lines(lines: &[String]) -> bool {
     //   - last msg is "assistant" with toolCall content → called a tool, turn continues
     // Inactive when:
     //   - last msg is "assistant" with usage, no toolCall → turn truly ended
+    //   - last msg is older than AGENT_ACTIVE_MAX_AGE_SECS (abandoned chat),
+    //     regardless of role or tool calls
+    if let Some(ts) = last_ts {
+        if (now - ts).num_seconds() > AGENT_ACTIVE_MAX_AGE_SECS {
+            return false;
+        }
+    }
     last_role == "user"
         || last_role == "toolResult"
         || (last_role == "assistant" && (!has_usage || has_tool_call))
+}
+
+#[cfg(test)]
+mod agent_active_tests {
+    use super::*;
+
+    fn line(role: &str, content: &str, ts: chrono::DateTime<chrono::Utc>) -> String {
+        format!(
+            r#"{{"type":"message","id":"m1","parentId":"m0","timestamp":"{}","message":{{"role":"{}","content":{},"timestamp":{}}}}}"#,
+            ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            role,
+            content,
+            ts.timestamp_millis(),
+        )
+    }
+
+    #[test]
+    fn user_last_line_one_hour_old_is_not_active() {
+        let now = chrono::Utc::now();
+        let lines = vec![line("user", r#""hello?""#, now - chrono::Duration::hours(1))];
+        assert!(!check_agent_active_from_lines_at(&lines, now));
+    }
+
+    #[test]
+    fn user_last_line_thirty_seconds_old_is_active() {
+        let now = chrono::Utc::now();
+        let lines = vec![line("user", r#""hello?""#, now - chrono::Duration::seconds(30))];
+        assert!(check_agent_active_from_lines_at(&lines, now));
+    }
+
+    #[test]
+    fn stale_assistant_tool_call_is_not_active() {
+        let now = chrono::Utc::now();
+        let content = r#"[{"type":"toolCall","name":"exec"}]"#;
+        let lines = vec![line("assistant", content, now - chrono::Duration::minutes(11))];
+        assert!(!check_agent_active_from_lines_at(&lines, now));
+    }
+
+    #[test]
+    fn fresh_assistant_final_reply_is_not_active() {
+        let now = chrono::Utc::now();
+        let ts = now - chrono::Duration::seconds(5);
+        let l = format!(
+            r#"{{"type":"message","timestamp":"{}","message":{{"role":"assistant","content":[{{"type":"text","text":"done"}}],"usage":{{"input":1}}}}}}"#,
+            ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        );
+        assert!(!check_agent_active_from_lines_at(&[l], now));
+    }
+
+    #[test]
+    fn missing_timestamp_keeps_legacy_role_rule() {
+        let now = chrono::Utc::now();
+        let l = r#"{"type":"message","message":{"role":"user","content":"hi"}}"#.to_string();
+        assert!(check_agent_active_from_lines_at(&[l], now));
+    }
+
+    #[test]
+    fn public_wrapper_uses_current_time() {
+        let recent = vec![line("user", r#""hi""#, chrono::Utc::now() - chrono::Duration::seconds(30))];
+        assert!(check_agent_active_from_lines(&recent));
+        let old = vec![line("user", r#""hi""#, chrono::Utc::now() - chrono::Duration::hours(1))];
+        assert!(!check_agent_active_from_lines(&old));
+    }
 }
 
 /// Build AgentHealth with session-level data from sessions.json + tail outputs.
