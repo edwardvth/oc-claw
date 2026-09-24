@@ -9394,13 +9394,14 @@ fn ax_open_chat_via_status_item() -> Result<(), String> {
     result
 }
 
-/// After the chat window is up: select the top row of OpenClaw's Sessions
-/// sidebar, which the app sorts by recency, so the most recent chat is shown
-/// instead of whatever session was open last. Needs Accessibility for oc-claw.
-/// Returns the selected row's text; on failure logs a compact map of the
-/// window's AX tree so the selector can be adjusted.
+/// Scan OpenClaw's chat window for the session links in its sidebar, in
+/// document order. The window is a web view: pinned sessions sit under a
+/// "PINNED" header, then the recency-sorted list under a "SESSIONS" header;
+/// each entry is an AXLink. Returns retained link refs (caller releases)
+/// for the SESSIONS list, or, if that header is absent, the session-looking
+/// links inside the sidebar group. Needs Accessibility for oc-claw.
 #[cfg(target_os = "macos")]
-fn select_most_recent_openclaw_session(log_failure: bool) -> Result<String, String> {
+fn scan_openclaw_sessions(log_failure: bool) -> Result<Vec<(ax::Ref, String)>, String> {
     if !check_accessibility_permission() {
         prompt_accessibility_permission();
         let msg = "most-recent-session selection needs Accessibility permission for oc-claw (System Settings > Privacy & Security > Accessibility)";
@@ -9411,25 +9412,19 @@ fn select_most_recent_openclaw_session(log_failure: bool) -> Result<String, Stri
     let app = ax::app(pid);
     let wins = ax::attr_list(app, "AXWindows");
     if wins.is_empty() { ax::release(app); return Err("OpenClaw has no AX windows".into()); }
-    // Prefer the window titled "OpenClaw" (the chat window) over settings/dashboard.
     let mut win = wins[0];
     for &w in &wins {
         if ax::attr_string(w, "AXTitle") == "OpenClaw" { win = w; break; }
     }
     ax::action(win, "AXRaise");
 
-    // The chat window is a web view. The sidebar lists pinned sessions under
-    // a "PINNED" header, then the recency-sorted list under a "SESSIONS"
-    // header; each entry is an AXLink followed by a time label and a pin
-    // button. Walk the tree in document order (DFS) and press the first link
-    // after the SESSIONS header — that is the most recent session.
     let mut stack: Vec<(ax::Ref, usize)> = vec![(win, 0)];
     let mut visited = 0usize;
     let mut dump: Vec<String> = Vec::new();
     let mut seen_sessions_header = false;
     let mut in_sessions_group = false;
-    let mut fallback: Option<(ax::Ref, String)> = None;
-    let mut result: Result<String, String> = Err("no session link found after the SESSIONS header".into());
+    let mut after_header: Vec<(ax::Ref, String)> = Vec::new();
+    let mut in_group: Vec<(ax::Ref, String)> = Vec::new();
     let skip_roles = ["AXStaticText", "AXImage", "AXButton", "AXTextArea", "AXTextField", "AXMenuButton", "AXPopUpButton", "AXLink"];
     let not_sessions = ["all sessions", "openclaw", "settings", "docs", "overview"];
     while let Some((node, depth)) = stack.pop() {
@@ -9447,69 +9442,92 @@ fn select_most_recent_openclaw_session(log_failure: bool) -> Result<String, Stri
         if role == "AXGroup" && title.eq_ignore_ascii_case("sessions") {
             in_sessions_group = true;
         }
+        let mut keep = false;
         if role == "AXLink" {
             let text = if !title.trim().is_empty() { title.trim().to_string() } else { ax::first_text(node, 3) };
             let lower = text.to_lowercase();
             let plausible = !text.is_empty() && !not_sessions.iter().any(|n| lower == *n);
-            if plausible && seen_sessions_header {
-                let ok = ax::action(node, "AXPress");
-                result = if ok { Ok(text) } else { Err(format!("found link '{}' but AXPress failed", text)) };
-                ax::release(node);
-                break;
-            }
-            if plausible && in_sessions_group && fallback.is_none() {
-                fallback = Some((node, text.clone()));
+            if plausible && seen_sessions_header && after_header.len() < 50 {
+                after_header.push((node, text));
+                keep = true;
+            } else if plausible && in_sessions_group && !seen_sessions_header && in_group.len() < 50 {
+                in_group.push((node, text));
+                keep = true;
             }
         }
         if depth < 40 && !skip_roles.contains(&role.as_str()) {
             let kids = ax::children(node);
             for k in kids.into_iter().rev() { stack.push((k, depth + 1)); }
         }
-        if node != win && fallback.as_ref().map(|f| f.0 != node).unwrap_or(true) { ax::release(node); }
+        if node != win && !keep { ax::release(node); }
     }
     for (n, _) in stack { if n != win { ax::release(n); } }
-    if result.is_err() {
-        if let Some((link, text)) = fallback.take() {
-            // No SESSIONS header found (layout changed?) — use the first session-looking
-            // link inside the sidebar group instead.
-            let ok = ax::action(link, "AXPress");
-            result = if ok { Ok(format!("{} (fallback: first sidebar link)", text)) } else { Err(format!("fallback link '{}' AXPress failed", text)) };
-            ax::release(link);
-        }
-    } else if let Some((link, _)) = fallback.take() {
-        ax::release(link);
-    }
     for w in wins { ax::release(w); }
     ax::release(app);
-    match &result {
-        Ok(name) => log::info!("[openclaw_chat] selected most recent session row: {} (visited {} nodes)", name, visited),
-        Err(e) if log_failure => log::warn!("[openclaw_chat] session selection failed: {} (visited {} nodes)\nAX tree (first {} nodes):\n{}", e, visited, dump.len(), dump.join("\n")),
-        Err(_) => {}
+
+    if !after_header.is_empty() {
+        for (n, _) in in_group { ax::release(n); }
+        return Ok(after_header);
     }
-    result
+    if !in_group.is_empty() {
+        log::info!("[openclaw_chat] no SESSIONS header found; using {} sidebar link(s) as fallback", in_group.len());
+        return Ok(in_group);
+    }
+    if log_failure {
+        log::warn!("[openclaw_chat] no session links found (visited {} nodes)\nAX tree (first {} nodes):\n{}", visited, dump.len(), dump.join("\n"));
+    }
+    Err("no session links found in the OpenClaw window".into())
 }
 
-/// Common tail for the success paths: give the window a moment, then try to
-/// select the most recent session. Selection problems never fail the click.
+/// Common tail for the success paths: once the sidebar's session list has
+/// loaded and is stable, press its first entry (the most recent session).
+/// Right after the window opens the list briefly contains only a placeholder
+/// "Main Session" until the gateway responds, so a single early read would
+/// pick the wrong row. Selection problems never fail the click.
 #[cfg(target_os = "macos")]
 fn finish_with_recent_session(step: &str) -> String {
-    // The web view may still be rendering when the window first appears, so
-    // retry quickly until the sidebar link is found (or ~3 s pass) instead of
-    // sleeping a fixed interval. Permission errors are not retried.
     let start = std::time::Instant::now();
+    let deadline = std::time::Duration::from_millis(4000);
     let mut attempts = 0u32;
+    let mut prev_first: Option<String> = None;
+    let mut last_seen: Option<(String, usize)> = None;
     loop {
         attempts += 1;
-        match select_most_recent_openclaw_session(start.elapsed() > std::time::Duration::from_millis(2500)) {
-            Ok(name) => {
-                log::info!("[openclaw_chat] session selected after {} attempt(s), {} ms", attempts, start.elapsed().as_millis());
-                return format!("{} + selected session '{}'", step, name);
+        let timed_out = start.elapsed() > deadline;
+        match scan_openclaw_sessions(timed_out) {
+            Ok(links) => {
+                let first = links[0].1.clone();
+                let count = links.len();
+                // Loaded and stable: at least two entries and the same top entry
+                // on two consecutive scans. After the deadline, take what we have.
+                let stable = count >= 2 && prev_first.as_deref() == Some(first.as_str());
+                if stable || timed_out {
+                    let ok = ax::action(links[0].0, "AXPress");
+                    for (n, _) in links { ax::release(n); }
+                    let ms = start.elapsed().as_millis();
+                    if ok {
+                        log::info!("[openclaw_chat] selected most recent session '{}' ({} entries, attempt {}, {} ms{})", first, count, attempts, ms, if timed_out { ", after timeout" } else { "" });
+                        return format!("{} + selected session '{}'", step, first);
+                    }
+                    log::warn!("[openclaw_chat] AXPress on session link '{}' failed", first);
+                    return format!("{} (session selection failed: AXPress on '{}' failed)", step, first);
+                }
+                last_seen = Some((first.clone(), count));
+                prev_first = Some(first);
+                for (n, _) in links { ax::release(n); }
             }
-            Err(e) if e.contains("Accessibility") || start.elapsed() > std::time::Duration::from_millis(3000) => {
+            Err(e) if e.contains("Accessibility") => {
                 return format!("{} (session selection skipped: {})", step, e);
             }
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(80)),
+            Err(e) => {
+                if timed_out {
+                    log::warn!("[openclaw_chat] session selection gave up after {} ms: {} (last seen: {:?})", start.elapsed().as_millis(), e, last_seen);
+                    return format!("{} (session selection skipped: {})", step, e);
+                }
+                prev_first = None;
+            }
         }
+        std::thread::sleep(std::time::Duration::from_millis(70));
     }
 }
 
